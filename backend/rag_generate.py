@@ -100,17 +100,13 @@ class RAGGenerator:
         TODO:
         1. Set config (use default if not provided):
            self.config = config or GenerationConfig()
-
         2. Initialize the retrieval pipeline:
            self.retrieval = retrieval_pipeline or RetrievalPipeline()
-
         3. Get OpenRouter API key (from config or environment):
            self.openrouter_api_key = self.config.openrouter_api_key or os.getenv("OPENROUTER_API_KEY")
-
         4. Validate API key exists:
            if not self.openrouter_api_key:
                raise ValueError("OPENROUTER_API_KEY not set")
-
         5. Store the base URL:
            self.openrouter_base_url = "https://openrouter.ai/api/v1"
 
@@ -118,20 +114,18 @@ class RAGGenerator:
             config: Optional configuration object
             retrieval_pipeline: Optional pre-initialized retrieval pipeline
         """
-        # (1) Use the provided config, or build one with defaults
+        # Set up config and the retrieval pipeline (reuse a pre-built one if
+        # given, which avoids rebuilding the BM25 index), and pass the
+        # use_reranker flag down to the pipeline where reranking happens.
         self.config = config or GenerationConfig()
-        # (2) Reuse a pre-built pipeline if given (saves rebuilding the BM25
-        # index), otherwise create one fresh from .env settings
         self.retrieval = retrieval_pipeline or RetrievalPipeline()
-        # Honor the use_reranker flag by passing it down to the retrieval
-        # pipeline, which is where reranking actually happens
         self.retrieval.config.use_reranker = self.config.use_reranker
-        # (3) API key priority: explicit config value wins, else .env
+
+        # Resolve the API key (config wins, else .env) and fail fast if it's
+        # missing rather than hitting a 401 mid-request later.
         self.openrouter_api_key = self.config.openrouter_api_key or os.getenv("OPENROUTER_API_KEY")
-        # (4) Fail fast with a clear message rather than a 401 later
         if not self.openrouter_api_key:
             raise ValueError("OPENROUTER_API_KEY not set")
-        # (5) All OpenRouter endpoints hang off this base URL
         self.openrouter_base_url = "https://openrouter.ai/api/v1"
 
     def refine_query(self, query: str) -> str:
@@ -140,12 +134,9 @@ class RAGGenerator:
 
         TODO:
         1. If self.config.refine_query is False, return query unchanged
-
         2. Build the prompt using QUERY_REFINEMENT_PROMPT.format(query=query)
-
         3. Build headers:
            {"Authorization": f"Bearer {self.openrouter_api_key}", "Content-Type": "application/json"}
-
         4. Build payload:
            {
                "model": self.config.refinement_model,
@@ -153,14 +144,10 @@ class RAGGenerator:
                "temperature": 0.3,
                "max_tokens": 100
            }
-
         5. Make POST request to f"{self.openrouter_base_url}/chat/completions"
-
         6. If request fails, return original query (don't crash)
-
         7. Parse response and extract the refined query from the response
            refined = response_json["choices"][0]["message"]["content"].strip()
-
         8. Return refined query (strip any quotes)
 
         Args:
@@ -169,27 +156,28 @@ class RAGGenerator:
         Returns:
             Refined query (or original if refinement disabled/fails)
         """
-        # (1) Refinement turned off? Skip the API call entirely
+        # Skip the API call entirely if refinement is turned off.
         if not self.config.refine_query:
             return query
-        # (2) Fill the user's question into the refinement prompt template
+
+        # Build the refinement request: the prompt template filled with the
+        # user's question, sent at a slightly higher temperature with a small
+        # token budget (a search query is short).
         prompt = QUERY_REFINEMENT_PROMPT.format(query=query)
-        # (3) Standard auth + JSON headers
         headers = {
             "Authorization": f"Bearer {self.openrouter_api_key}",
             "Content-Type": "application/json",
         }
-        # (4) Chat-completion payload: one user message, slightly higher
-        # temperature (0.3) is fine for rewording, max 100 tokens since a
-        # search query is short
         payload = {
             "model": self.config.refinement_model,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.3,
             "max_tokens": 100,
         }
-        # (5)+(6) Make the request, but wrap in try/except - refinement is
-        # a nice-to-have, so on ANY failure we fall back to the raw query
+
+        # Refinement is a nice-to-have, so on ANY failure (bad status, network
+        # error, empty answer) fall back to the original query. Strip quotes
+        # the model sometimes wraps around its answer.
         try:
             response = requests.post(
                 f"{self.openrouter_base_url}/chat/completions",
@@ -199,13 +187,9 @@ class RAGGenerator:
             )
             if response.status_code != 200:
                 return query
-            # (7) Drill into the standard chat-completion response shape:
-            # {"choices": [{"message": {"content": "..."}}]}
             refined = response.json()["choices"][0]["message"]["content"].strip()
-            # Empty answer? Keep the original
             if not refined:
                 return query
-            # (8) Models sometimes wrap their answer in quotes - strip them
             return refined.strip('"').strip("'")
         except Exception:
             return query
@@ -216,7 +200,6 @@ class RAGGenerator:
 
         TODO:
         1. Build a list of formatted source strings
-
         2. For each result (enumerate with index starting at 1):
            formatted = f'''
            --- Source {i} ---
@@ -227,9 +210,7 @@ class RAGGenerator:
            Content:
            {result.text}
            '''
-
         3. Join all formatted strings with newlines
-
         4. Return the combined context string
 
         Args:
@@ -238,10 +219,10 @@ class RAGGenerator:
         Returns:
             Formatted context string
         """
-        # (1) Collect one formatted block per retrieved chunk
+        # Turn each retrieved chunk into a numbered block carrying the metadata
+        # the LLM needs for [Paper Title] citations, then join them into one
+        # context string.
         formatted_sources = []
-        # (2) Number the sources from 1 so the LLM can refer to them; each
-        # block carries the metadata the LLM needs for [Paper Title] citations
         for i, result in enumerate(results, 1):
             formatted = f"""
 --- Source {i} ---
@@ -253,7 +234,6 @@ Content:
 {result.text}
 """
             formatted_sources.append(formatted)
-        # (3)+(4) Stitch all blocks into one big context string
         return "\n".join(formatted_sources)
 
     def _build_sources_metadata(self, results: list[RetrievalResult]) -> dict:
@@ -264,7 +244,6 @@ Content:
         TODO:
         1. Create a dict to track seen titles (for deduplication):
            seen = {}
-
         2. For each result:
            - If title not in seen:
              - Add to seen with value:
@@ -277,7 +256,6 @@ Content:
                    "acm_url": result.acm_url,
                    "abstract_url": result.abstract_url,
                }
-
         3. Return list(seen.values())
 
         Args:
@@ -286,11 +264,10 @@ Content:
         Returns:
             List of unique source metadata dicts
         """
-        # (1) Dict keyed by title - multiple chunks of the same paper would
-        # otherwise show up as duplicate citations in the UI
+        # Deduplicate by title (multiple chunks of one paper would otherwise
+        # show as duplicate citations) - first chunk of each paper wins, and
+        # dict insertion order keeps the best paper first.
         seen = {}
-        # (2) First chunk of each paper wins; later chunks of the same paper
-        # are skipped by the "not in seen" check
         for result in results:
             if result.title not in seen:
                 seen[result.title] = {
@@ -302,13 +279,9 @@ Content:
                     "acm_url": result.acm_url,
                     "abstract_url": result.abstract_url,
                 }
-        # (3) NOTE: the TODO above says to return list(seen.values()), but
-        # that contradicts api_server.py (lines 294/492), which calls
-        # .values() on this return value - i.e. it expects the DICT, just
-        # like the mock in test_backend_integration.py returns. So we
-        # return the dict; callers turn it into a list themselves.
-        # (dict preserves insertion order, so sources stay ranked by
-        # relevance - best paper first)
+        # NOTE: the TODO says return list(seen.values()), but api_server.py
+        # calls .values() on this return value (and the mock returns a dict),
+        # so we return the dict; callers turn it into a list themselves.
         return seen
 
     def _call_llm(self, query: str, context: str) -> str:
@@ -325,10 +298,8 @@ Content:
            {context}
 
            Remember to cite papers using [Paper Title] format.'''
-
         2. Build headers:
            {"Authorization": f"Bearer {self.openrouter_api_key}", "Content-Type": "application/json"}
-
         3. Build payload:
            {
                "model": self.config.llm_model,
@@ -339,14 +310,10 @@ Content:
                "temperature": self.config.temperature,
                "max_tokens": self.config.max_tokens
            }
-
         4. Make POST request to f"{self.openrouter_base_url}/chat/completions"
-
         5. Check response status, raise error if not 200
-
         6. Parse response and extract answer from the response
            answer = response_json["choices"][0]["message"]["content"]
-
         7. Return the answer
 
         Args:
@@ -356,9 +323,9 @@ Content:
         Returns:
             Generated answer string
         """
-        # (1) The user message = question + all retrieved excerpts. This is
-        # the "augmented" part of Retrieval-Augmented Generation: the LLM
-        # answers from THIS text, not from its training memory.
+        # Build the request: the system prompt sets the rules (cite, don't
+        # invent), the user message carries the question + retrieved excerpts
+        # (the "augmented" part of RAG - the LLM answers from THIS, not memory).
         user_message = f"""Based on the following research paper excerpts, answer this question.
 
 Question: {query}
@@ -367,14 +334,10 @@ Research Paper Excerpts:
 {context}
 
 Remember to cite papers using [Paper Title] format."""
-        # (2) Standard auth + JSON headers
         headers = {
             "Authorization": f"Bearer {self.openrouter_api_key}",
             "Content-Type": "application/json",
         }
-        # (3) Two messages: the system prompt sets the rules (cite, don't
-        # invent), the user message carries the question + evidence. Low
-        # temperature keeps the answer factual rather than creative.
         payload = {
             "model": self.config.llm_model,
             "messages": [
@@ -384,24 +347,21 @@ Remember to cite papers using [Paper Title] format."""
             "temperature": self.config.temperature,
             "max_tokens": self.config.max_tokens,
         }
-        # (4) This is the expensive call - generous timeout since the model
-        # may write a long answer
+
+        # Send it (generous timeout since the answer can be long). Unlike
+        # refinement, generation failing IS fatal - there is no answer without
+        # it - so raise with details, then return the generated text.
         response = requests.post(
             f"{self.openrouter_base_url}/chat/completions",
             headers=headers,
             json=payload,
             timeout=120,
         )
-        # (5) Unlike refinement, generation failing IS fatal - there is no
-        # answer without it, so raise with details
         if response.status_code != 200:
             raise RuntimeError(
                 f"OpenRouter chat request failed ({response.status_code}): {response.text}"
             )
-        # (6) Extract the generated text from the standard response shape
-        answer = response.json()["choices"][0]["message"]["content"]
-        # (7) Return the answer
-        return answer
+        return response.json()["choices"][0]["message"]["content"]
 
     def generate(self, query: str, top_k: Optional[int] = None, return_sources: bool = True) -> dict:
         """
@@ -410,9 +370,7 @@ Remember to cite papers using [Paper Title] format."""
 
         TODO:
         1. Refine the query:
-
         2. Retrieve relevant chunks:
-
         3. Handle empty results:
            if not results:
                return {
@@ -421,11 +379,8 @@ Remember to cite papers using [Paper Title] format."""
                    "answer": "I couldn't find any relevant papers to answer this question.",
                    "sources": []
                }
-
         4. Format context from results:
-
         5. Generate answer using LLM:
-
         6. Build and return response dict:
            {
                "query": query,
@@ -442,14 +397,13 @@ Remember to cite papers using [Paper Title] format."""
         Returns:
             Dict with query, refined_query, answer, and sources
         """
-        # (1) Optionally rewrite the question into a better search query
-        # (e.g. "how do those splat things work?" -> "3D Gaussian Splatting")
+        # Refine the question into a better search query, then retrieve the
+        # relevant chunks for it.
         refined = self.refine_query(query)
-        # (2) Run the full Step-2 retrieval pipeline on the refined query.
-        # top_k falls back to the config default (8) when not specified.
         results = self.retrieval.retrieve(refined, top_k=top_k or self.config.retrieval_top_k)
-        # (3) Nothing relevant found? Say so honestly instead of letting the
-        # LLM improvise an answer from thin air
+
+        # If nothing relevant was found, say so honestly instead of letting the
+        # LLM improvise an answer from thin air.
         if not results:
             return {
                 "query": query,
@@ -457,16 +411,12 @@ Remember to cite papers using [Paper Title] format."""
                 "answer": "I couldn't find any relevant papers to answer this question.",
                 "sources": [],
             }
-        # (4) Turn the chunks into the numbered text blocks the LLM reads
+
+        # Format the chunks into context, generate the cited answer (passing
+        # the ORIGINAL query - the answer should address what the user asked),
+        # and package it with the deduplicated source metadata for the UI.
         context = self._format_context(results)
-        # (5) The actual generation: question + evidence -> cited answer.
-        # NOTE: we pass the ORIGINAL query, not the refined one - the answer
-        # should address what the user actually asked.
         answer = self._call_llm(query, context)
-        # (6) Package everything the frontend needs: the answer text plus
-        # deduplicated paper metadata for the clickable source cards.
-        # _build_sources_metadata returns a dict (see note there), so we
-        # convert to a list here - same as the mock does.
         return {
             "query": query,
             "refined_query": refined,
